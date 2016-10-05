@@ -8,116 +8,67 @@
  */
 'use strict';
 
-const EventEmitter  = require('events').EventEmitter;
-const denodeify = require('denodeify');
-const sane = require('sane');
-const execSync = require('child_process').execSync;
+jest
+  .dontMock('util')
+  .dontMock('events')
+  .dontMock('../')
+  .setMock('child_process', {
+    execSync: () => '/usr/bin/watchman',
+  });
 
-const MAX_WAIT_TIME = 120000;
+describe('FileWatcher', () => {
+  let WatchmanWatcher;
+  let FileWatcher;
+  let config;
 
-const detectWatcherClass = () => {
-  try {
-    execSync('watchman version', {stdio: 'ignore'});
-    return sane.WatchmanWatcher;
-  } catch (e) {}
-  return sane.NodeWatcher;
-};
-
-const WatcherClass = detectWatcherClass();
-
-let inited = false;
-
-class FileWatcher extends EventEmitter {
-
-  constructor(rootConfigs) {
-    if (inited) {
-      throw new Error('FileWatcher can only be instantiated once');
-    }
-    inited = true;
-
-    super();
-    this._watcherByRoot = Object.create(null);
-
-    const watcherPromises = rootConfigs.map((rootConfig) => {
-      return this._createWatcher(rootConfig);
-    });
-
-    this._loading = Promise.all(watcherPromises).then(watchers => {
-      watchers.forEach((watcher, i) => {
-        this._watcherByRoot[rootConfigs[i].dir] = watcher;
-        watcher.on(
-          'all',
-          // args = (type, filePath, root, stat)
-          (...args) => this.emit('all', ...args)
-        );
-      });
-      return watchers;
-    });
-  }
-
-  getWatchers() {
-    return this._loading;
-  }
-
-  getWatcherForRoot(root) {
-    return this._loading.then(() => this._watcherByRoot[root]);
-  }
-
-  isWatchman() {
-    return Promise.resolve(FileWatcher.canUseWatchman());
-  }
-
-  end() {
-    inited = false;
-    return this._loading.then(
-      (watchers) => watchers.map(
-        watcher => denodeify(watcher.close).call(watcher)
-      )
+  beforeEach(() => {
+    const sane = require('sane');
+    WatchmanWatcher = sane.WatchmanWatcher;
+    WatchmanWatcher.prototype.once.mockImplementation(
+      (type, callback) => callback()
     );
-  }
 
-  _createWatcher(rootConfig) {
-    const watcher = new WatcherClass(rootConfig.dir, {
-      glob: rootConfig.globs,
-      dot: false,
-    });
+    FileWatcher = require('../');
 
-    return new Promise((resolve, reject) => {
-      const rejectTimeout = setTimeout(
-        () => reject(new Error(timeoutMessage(WatcherClass))),
-        MAX_WAIT_TIME
-      );
+    config = [{
+      dir: 'rootDir',
+      globs: [
+        '**/*.js',
+        '**/*.json',
+      ],
+    }];
+  });
 
-      watcher.once('ready', () => {
-        clearTimeout(rejectTimeout);
-        resolve(watcher);
+  pit('gets the watcher instance when ready', () => {
+    const fileWatcher = new FileWatcher(config);
+    return fileWatcher.getWatchers().then(watchers => {
+      watchers.forEach(watcher => {
+        expect(watcher instanceof WatchmanWatcher).toBe(true);
       });
     });
-  }
+  });
 
-  static createDummyWatcher() {
-    return Object.assign(new EventEmitter(), {
-      isWatchman: () => Promise.resolve(false),
-      end: () => Promise.resolve(),
+  pit('emits events', () => {
+    let cb;
+    WatchmanWatcher.prototype.on.mockImplementation((type, callback) => {
+      cb = callback;
     });
-  }
+    const fileWatcher = new FileWatcher(config);
+    const handler = jest.genMockFn();
+    fileWatcher.on('all', handler);
+    return fileWatcher.getWatchers().then(watchers => {
+      cb(1, 2, 3, 4);
+      jest.runAllTimers();
+      expect(handler.mock.calls[0]).toEqual([1, 2, 3, 4]);
+    });
+  });
 
-  static canUseWatchman() {
-    return WatcherClass == sane.WatchmanWatcher;
-  }
-}
+  pit('ends the watcher', () => {
+    const fileWatcher = new FileWatcher(config);
+    WatchmanWatcher.prototype.close.mockImplementation(callback => callback());
 
-function timeoutMessage(Watcher) {
-  const lines = [
-    'Watcher took too long to load (' + Watcher.name + ')',
-  ];
-  if (Watcher === sane.WatchmanWatcher) {
-    lines.push(
-      'Try running `watchman version` from your terminal',
-      'https://facebook.github.io/watchman/docs/troubleshooting.html',
-    );
-  }
-  return lines.join('\n');
-}
-
-module.exports = FileWatcher;
+    return fileWatcher.end().then(() => {
+      expect(WatchmanWatcher.prototype.close).toBeCalled();
+    });
+  });
+});
